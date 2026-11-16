@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Slipway — Ammora Launch Terminal on GIWA Sepolia</title>
+    <meta
+      name="description"
+      content="Slipway is a launch terminal for Ammora launch curves on GIWA Sepolia testnet. It discovers live launches, quotes curves, and plans new launches through the official Ammora SDK."
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <script type="module" crossorigin src="/slipway/assets/index-BhiOrs4P.js"></script>
+    <link rel="stylesheet" crossorigin href="/slipway/assets/index-BwJx0hwr.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="wordmark">
+        <span class="mark" aria-hidden="true"></span>
+        <span class="name">SLIPWAY</span>
+        <span class="tag">Ammora launch terminal</span>
+      </div>
+      <div class="topbar-right">
+        <span class="netstat"><span class="dot" aria-hidden="true"></span><span id="blockTicker">GIWA Sepolia · connecting…</span></span>
+        <button id="connectBtn" class="btn ghost" type="button">Connect wallet</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="hero-copy">
+          <h1>Launch on the curve,<br />not on a hope.</h1>
+          <p class="lede">
+            Slipway is a working terminal for Ammora's launch curves on the GIWA Sepolia
+            testnet. It finds every launch the factory has created, prices curves with live
+            SDK quotes, and walks a new token from name to launch plan, all against live
+            chain state.
+          </p>
+          <dl class="stats">
+            <div>
+              <dt>Launches found</dt>
+              <dd id="statLaunches">…</dd>
+            </div>
+            <div>
+              <dt>Launch configs live</dt>
+              <dd id="statConfigs">…</dd>
+            </div>
+            <div>
+              <dt>Launch factory</dt>
+              <dd id="statFactory" class="mono">…</dd>
+            </div>
+          </dl>
+          <p class="scanline mono" id="scanLine">Starting factory scan…</p>
+        </div>
+
+        <div class="chart-panel" aria-live="polite">
+          <div class="chart-head">
+            <div>
+              <h2 id="chartTitle">No launch selected</h2>
+              <p class="chart-sub mono" id="chartSub">Pick a launch from the board below.</p>
+            </div>
+            <span class="status-pill" id="chartStatus">—</span>
+          </div>
+          <div id="chartBox" class="chart-box">
+            <p class="chart-empty">The curve chart draws itself from live SDK quotes once a launch is selected.</p>
+          </div>
+          <dl class="chart-stats">
+            <div>
+              <dt>Spot price</dt>
+              <dd id="csPrice">—</dd>
+            </div>
+            <div>
+              <dt>Quote reserve</dt>
+              <dd id="csQuoteReserve">—</dd>
+            </div>
+            <div>
+              <dt>Base reserve</dt>
+              <dd id="csBaseReserve">—</dd>
+            </div>
+            <div>
+              <dt>Curve fee</dt>
+              <dd id="csFee">—</dd>
+            </div>
+          </dl>
+          <div class="migration">
+            <div class="migration-head">
+              <span>Migration progress</span>
+              <span class="mono" id="migLabel">—</span>
+            </div>
+            <div class="migration-track"><div class="migration-fill" id="migFill" style="width: 0%"></div></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="board-section">
+        <div class="section-head">
+          <h2>Launch board</h2>
+          <p>Every <span class="mono">LaunchCreated</span> event from the Ammora atomic launch factory, newest first. Select a row to inspect its curve.</p>
+        </div>
+        <div class="table-wrap">
+          <table class="board">
+            <thead>
+              <tr>
+                <th>Token</th>
+                <th>Config</th>
+                <th>Block</th>
+                <th>Creator</th>
+                <th>Curve</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="boardBody">
+              <tr><td colspan="6" class="board-empty">Scanning the factory…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="lower">
+        <div class="panel quote-panel">
+          <h2>Quote the curve</h2>
+          <p class="panel-note">Live quotes from the SDK's <span class="mono">ALCClient</span> against the selected launch. Read-only: nothing is signed or sent.</p>
+          <div class="quote-controls">
+            <div class="seg" role="group" aria-label="Direction">
+              <button type="button" id="dirBuy" class="seg-btn active">Buy</button>
+              <button type="button" id="dirSell" class="seg-btn">Sell</button>
+            </div>
+            <label class="amount-label">
+              <span id="amountLabel">You pay (WETH)</span>
+              <input id="quoteAmount" type="text" inputmode="decimal" value="0.1" autocomplete="off" />
+            </label>
+          </div>
+          <dl class="quote-out">
+            <div>
+              <dt id="quoteOutLabel">You receive</dt>
+              <dd id="quoteOut">—</dd>
+            </div>
+            <div>
+              <dt>Curve fee</dt>
+              <dd id="quoteFee">—</dd>
+            </div>
+            <div>
+              <dt>Effective price</dt>
+              <dd id="quotePrice">—</dd>
+            </div>
+          </dl>
+          <p class="quote-msg mono" id="quoteMsg"></p>
+        </div>
+
+        <div class="panel wizard-panel">
+          <h2>Plan a launch</h2>
+          <p class="panel-note">The same three inputs the factory takes. Slipway predicts the token and curve addresses with the SDK, then simulates the launch against live state before anything is signed.</p>
+          <ol class="steps">
+            <li>
+              <span class="step-name">Token</span>
+              <div class="step-fields">
+                <label>Name <input id="wName" type="text" value="Northbeam" maxlength="64" autocomplete="off" /></label>
+                <label>Symbol <input id="wSymbol" type="text" value="NBM" maxlength="16" autocomplete="off" /></label>
+                <label class="wide">Metadata URI <input id="wUri" type="text" value="ipfs://slipway-demo-launch" maxlength="200" autocomplete="off" /></label>
+              </div>
+            </li>
+            <li>
+              <span class="step-name">Curve config</span>
+              <div class="step-fields">
+                <label class="wide">Config
+                  <select id="wConfig"></select>
+                </label>
+              </div>
+            </li>
+            <li>
+              <span class="step-name">Review</span>
+              <div class="step-fields">
+                <p class="creator-line">Creator: <span class="mono" id="wCreator">demo address (preview only)</span></p>
+                <div class="wizard-actions">
+                  <button type="button" class="btn primary" id="wPreview">Predict and simulate</button>
+                  <button type="button" class="btn signal" id="wLaunch" disabled>Launch on testnet</button>
+                </div>
+                <div class="plan-out mono" id="planOut">No plan yet. Run a preview to see the predicted addresses and the simulation verdict.</div>
+              </div>
+            </li>
+          </ol>
+        </div>
+      </section>
+
+      <section class="configs-section">
+        <div class="section-head">
+          <h2>Launch configs</h2>
+          <p>Curve templates registered in the Ammora config registry. A launch picks one; its segments set the price path from first buy to migration.</p>
+        </div>
+        <div id="configList" class="config-list">
+          <p class="board-empty">Reading the registry…</p>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="foot-grid">
+        <div>
+          <p class="foot-title">Slipway</p>
+          <p>An independent builder project on the Ammora protocol. Testnet only: GIWA Sepolia (chain 91342), no real funds anywhere in this app.</p>
+        </div>
+        <div>
+          <p class="foot-title">Contracts (from the SDK deployment registry)</p>
+          <p class="mono" id="footContracts">…</p>
+        </div>
+        <div>
+          <p class="foot-title">Built with</p>
+          <p>@ammora-protocol/sdk 0.3.9 · viem · TypeScript<br />Quotes, predictions, and discovery run through the SDK against live chain state.</p>
+        </div>
+      </div>
+    </footer>
+
+  </body>
+</html>
