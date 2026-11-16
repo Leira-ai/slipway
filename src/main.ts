@@ -59,14 +59,21 @@ let direction: 'buy' | 'sell' = 'buy';
 let selectionSeq = 0;
 let lastPlan: { name: string; symbol: string; uri: string; configId: bigint } | null = null;
 const metaByToken = new Map<string, TokenMeta>();
+const unavailableCurves = new Set<string>();
+let userPicked = false;
+let autoSelecting = false;
 
 // ---------- header ----------
+let blockFailures = 0;
 async function tickBlock() {
   try {
     const n = await getBlockNumber();
+    blockFailures = 0;
     $('blockTicker').textContent = `GIWA Sepolia · block ${fmtInt(Number(n))}`;
   } catch {
-    $('blockTicker').textContent = 'GIWA Sepolia · RPC unreachable';
+    // Do not flash "unreachable" for a single hiccup; reads already retry.
+    blockFailures++;
+    if (blockFailures >= 2) $('blockTicker').textContent = 'GIWA Sepolia · RPC unreachable, retrying…';
   }
 }
 
@@ -100,20 +107,24 @@ function renderBoard() {
     .map((l) => {
       const meta = metaByToken.get(l.token.toLowerCase());
       const isSel = selected && selected.curve.toLowerCase() === l.curve.toLowerCase();
+      const unavail = unavailableCurves.has(l.curve.toLowerCase());
       return `<tr data-curve="${l.curve}" class="${isSel ? 'selected' : ''}">
         <td><span class="token-name">${meta ? esc(meta.name) : 'Loading…'}</span><span class="token-sym">${meta ? esc(meta.symbol) : ''}</span></td>
         <td class="mono">#${esc(l.configId)}</td>
         <td class="mono">${fmtInt(l.block)}</td>
         <td class="mono">${short(l.creator)}</td>
         <td class="mono">${short(l.curve)}</td>
-        <td>${isSel ? 'Selected' : 'Inspect'}</td>
+        <td>${isSel ? 'Selected' : unavail ? 'Unavailable' : 'Inspect'}</td>
       </tr>`;
     })
     .join('');
   for (const row of body.querySelectorAll('tr[data-curve]')) {
     row.addEventListener('click', () => {
       const rec = launches.find((l) => l.curve === row.getAttribute('data-curve'));
-      if (rec) void selectLaunch(rec);
+      if (rec) {
+        userPicked = true;
+        void selectLaunch(rec);
+      }
     });
   }
 }
@@ -122,6 +133,9 @@ async function ensureMeta(rec: LaunchRec) {
   const key = rec.token.toLowerCase();
   if (metaByToken.has(key)) return;
   const meta = await tokenMeta(rec.token);
+  // Unresolved fallbacks are not pinned into the board map: tokenMeta does
+  // not cache failures, so a later scan update retries the reads.
+  if (!meta.resolved) return;
   metaByToken.set(key, meta);
   renderBoard();
   if (selected && selected.token.toLowerCase() === key) {
@@ -196,7 +210,7 @@ async function selectLaunch(rec: LaunchRec) {
   const meta = await tokenMeta(rec.token);
   if (seq !== selectionSeq) return;
   selectedMeta = meta;
-  metaByToken.set(rec.token.toLowerCase(), meta);
+  if (meta.resolved) metaByToken.set(rec.token.toLowerCase(), meta);
   const [state, sample] = await Promise.all([
     curveState(rec.curve),
     sampleCurve(rec.curve, meta.decimals, 18),
@@ -204,8 +218,66 @@ async function selectLaunch(rec: LaunchRec) {
   if (seq !== selectionSeq) return;
   selectedState = state;
   renderSelectedHead();
+  if (sample.points.length < 2) {
+    // The curve does not answer quotes on either side (paused or fully
+    // migrated). Mark it clearly, never surface raw RPC errors, and, when
+    // this was the automatic pick, move on to the next live launch.
+    unavailableCurves.add(rec.curve.toLowerCase());
+    renderBoard();
+    drawChart(sample.points, sample.side, meta.symbol);
+    const msgEl = $('quoteMsg');
+    msgEl.classList.add('error');
+    msgEl.textContent = 'This launch is unavailable: its curve is not answering quotes (paused or fully migrated). Pick another launch from the board.';
+    if (!userPicked) void autoSelect();
+    return;
+  }
+  unavailableCurves.delete(rec.curve.toLowerCase());
   drawChart(sample.points, sample.side, meta.symbol);
   void runQuote();
+}
+
+/** Cheap liveness probe: one small quote per side, with retries inside quote(). */
+async function probeCurve(rec: LaunchRec): Promise<boolean> {
+  try {
+    await quote(rec.curve, 10n ** 15n, false);
+    return true;
+  } catch {
+    /* buy side silent: try sell side */
+  }
+  try {
+    await quote(rec.curve, 10n ** 12n, true);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Default selection: the newest launch whose curve actually answers quotes.
+ * The newest launch overall is often already paused or migrated, so picking
+ * launches[0] blindly landed the page on a dead curve.
+ */
+async function autoSelect() {
+  if (autoSelecting || userPicked) return;
+  if (selected && !unavailableCurves.has(selected.curve.toLowerCase())) return;
+  autoSelecting = true;
+  try {
+    const candidates = launches.slice(0, 15);
+    for (const rec of candidates) {
+      if (unavailableCurves.has(rec.curve.toLowerCase())) continue;
+      if (await probeCurve(rec)) {
+        await selectLaunch(rec);
+        return;
+      }
+      unavailableCurves.add(rec.curve.toLowerCase());
+      renderBoard();
+    }
+    // Nothing in the newest 15 answers: fall back to the newest launch so
+    // the page still shows its (unavailable) state instead of staying blank.
+    if (candidates.length && !selected) await selectLaunch(candidates[0]);
+  } finally {
+    autoSelecting = false;
+  }
 }
 
 // ---------- quote panel ----------
@@ -264,12 +336,13 @@ async function runQuote() {
       priceEl.textContent = inHuman > 0 ? `${fmtPrice(outHuman / inHuman)} WETH` : '—';
     }
     msgEl.textContent = 'Quote is live from ALCClient.quoteExactInput at the current block.';
-  } catch (e) {
+  } catch {
     outEl.textContent = '—';
     feeEl.textContent = '—';
     priceEl.textContent = '—';
     msgEl.classList.add('error');
-    msgEl.textContent = `This side of the curve did not answer: ${e instanceof Error ? e.message.slice(0, 140) : 'unknown error'}`;
+    msgEl.textContent =
+      'No live quote is available for this launch right now. Its curve may be paused or fully migrated; try the other direction or pick another launch from the board.';
   }
 }
 
@@ -371,7 +444,7 @@ function onScanUpdate(u: { launches: LaunchRec[]; scanning: boolean }) {
     }, 600);
   }
   for (const rec of launches.slice(0, 60)) void ensureMeta(rec);
-  if (!selected && launches.length) void selectLaunch(launches[0]);
+  if (launches.length && (!selected || unavailableCurves.has(selected.curve.toLowerCase()))) void autoSelect();
 }
 
 function boot() {

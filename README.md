@@ -53,3 +53,12 @@ npm run dev
   through the SDK's exported registry ABI (`enabled`, `getCurve`,
   `configHash`), which decodes correctly, and uses `ALCClient` where it
   works: quotes and launch prediction.
+- RPC reliability note: the GIWA public RPC drops calls when a large burst
+  of concurrent `eth_call`s lands at once (measured: 40 of 60 concurrent
+  token metadata reads returned nothing, sequential reads all succeeded).
+  Slipway therefore avoids batched transports, runs token metadata through
+  a 3-wide queue with retries, samples curves in small batches, retries
+  every read with backoff, and never caches a failed metadata lookup. The
+  default board selection probes the newest launches and lands on the
+  first curve that actually answers quotes; curves that answer on neither
+  side are labelled Unavailable instead of showing raw RPC errors.

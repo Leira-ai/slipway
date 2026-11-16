@@ -42,8 +42,28 @@ export const giwaChain = defineChain({
 
 export const publicClient: PublicClient = createPublicClient({
   chain: giwaChain,
-  transport: http(RPC_URL, { batch: true, timeout: 30_000 }),
+  // No batch:true: the GIWA public RPC silently drops calls when a burst of
+  // batched eth_calls lands at once (measured: 40 of 60 concurrent token
+  // metadata reads returned nothing while sequential reads all succeeded).
+  // Plain transport + explicit retries below is slower but reliable.
+  transport: http(RPC_URL, { timeout: 30_000, retryCount: 3, retryDelay: 600 }),
 });
+
+// ---------- retry helper (the public RPC throttles bursts and hiccups) ----------
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+export async function withRetry<T>(fn: () => Promise<T>, attempts = 4, baseDelayMs = 400): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      if (i < attempts - 1) await sleep(baseDelayMs * 2 ** i + Math.floor(Math.random() * 150));
+    }
+  }
+  throw lastErr;
+}
 
 const factoryAbi = segmentedALCLaunchFactoryV3Abi as unknown as readonly Record<string, unknown>[];
 const curveAbi = segmentedBondingCurveV3Abi as unknown as readonly Record<string, unknown>[];
@@ -65,6 +85,8 @@ export interface TokenMeta {
   name: string;
   symbol: string;
   decimals: number;
+  /** false when the reads failed and name/symbol are display fallbacks only */
+  resolved: boolean;
 }
 
 export interface CurveState {
@@ -89,7 +111,9 @@ export interface LaunchConfig {
 // ---------- local cache (discovery is a long log scan; keep progress) ----------
 const LS_LAUNCHES = 'slipway.v1.launches';
 const LS_RANGES = 'slipway.v1.ranges';
-const LS_META = 'slipway.v1.meta';
+// v2: the v1 meta cache could contain poisoned entries ("Unknown token"
+// fallbacks cached after throttled reads). A new key abandons them.
+const LS_META = 'slipway.v2.meta';
 
 function lsGet<T>(key: string): T | null {
   try {
@@ -109,7 +133,7 @@ function lsSet(key: string, value: unknown) {
 
 // ---------- block + discovery ----------
 export function getBlockNumber(): Promise<bigint> {
-  return publicClient.getBlockNumber();
+  return withRetry(() => publicClient.getBlockNumber(), 3, 500);
 }
 
 type Range = [number, number];
@@ -172,17 +196,22 @@ export async function scanLaunches(onUpdate: (u: ScanUpdate) => void): Promise<v
     await Promise.all(
       batch.map(async ([from, to]) => {
         try {
-          const logs = (await publicClient.request({
-            method: 'eth_getLogs',
-            params: [
-              {
-                address: FACTORY,
-                topics: [LAUNCH_TOPIC],
-                fromBlock: `0x${from.toString(16)}`,
-                toBlock: `0x${to.toString(16)}`,
-              },
-            ],
-          } as never)) as { topics: Hex[]; data: Hex; blockNumber: Hex }[];
+          const logs = (await withRetry(
+            () =>
+              publicClient.request({
+                method: 'eth_getLogs',
+                params: [
+                  {
+                    address: FACTORY,
+                    topics: [LAUNCH_TOPIC],
+                    fromBlock: `0x${from.toString(16)}`,
+                    toBlock: `0x${to.toString(16)}`,
+                  },
+                ],
+              } as never),
+            3,
+            600,
+          )) as { topics: Hex[]; data: Hex; blockNumber: Hex }[];
           for (const log of logs) {
             try {
               const decoded = decodeEventLog({
@@ -220,24 +249,83 @@ export async function scanLaunches(onUpdate: (u: ScanUpdate) => void): Promise<v
 }
 
 // ---------- token metadata ----------
+// Root cause of the "Unknown token (???)" board bug: the old version fired
+// 3 reads x ~60 tokens concurrently through a batched transport; the public
+// RPC dropped most of them, and the failure fallback was then cached in
+// localStorage forever. Fixes: reads go through a small concurrency queue
+// with retries, and only successful resolutions are ever cached.
 const metaCache = new Map<string, TokenMeta>();
-for (const [k, v] of Object.entries(lsGet<Record<string, TokenMeta>>(LS_META) ?? {})) metaCache.set(k, v);
+for (const [k, v] of Object.entries(lsGet<Record<string, TokenMeta>>(LS_META) ?? {})) {
+  if (v && v.name && v.name !== 'Unknown token' && v.symbol && v.symbol !== '???') {
+    metaCache.set(k, { ...v, resolved: true });
+  }
+}
+const metaInflight = new Map<string, Promise<TokenMeta>>();
+const metaFailedAt = new Map<string, number>();
+const META_RETRY_AFTER_MS = 20_000;
 
-export async function tokenMeta(token: Address): Promise<TokenMeta> {
+let metaActive = 0;
+const metaWaiters: Array<() => void> = [];
+function metaAcquire(): Promise<void> {
+  if (metaActive < 3) {
+    metaActive++;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) =>
+    metaWaiters.push(() => {
+      metaActive++;
+      resolve();
+    }),
+  );
+}
+function metaRelease() {
+  metaActive--;
+  const next = metaWaiters.shift();
+  if (next) next();
+}
+
+const META_FALLBACK: TokenMeta = { name: 'Unknown token', symbol: '???', decimals: 18, resolved: false };
+
+export function tokenMeta(token: Address): Promise<TokenMeta> {
   const key = token.toLowerCase();
   const hit = metaCache.get(key);
-  if (hit) return hit;
-  const read = async (functionName: 'name' | 'symbol' | 'decimals') =>
-    publicClient.readContract({ address: token, abi: erc20Abi, functionName } as never).catch(() => null);
-  const [name, symbol, decimals] = await Promise.all([read('name'), read('symbol'), read('decimals')]);
-  const meta: TokenMeta = {
-    name: (name as string) ?? 'Unknown token',
-    symbol: (symbol as string) ?? '???',
-    decimals: (decimals as number) ?? 18,
-  };
-  metaCache.set(key, meta);
-  lsSet(LS_META, Object.fromEntries(metaCache));
-  return meta;
+  if (hit) return Promise.resolve(hit);
+  const flying = metaInflight.get(key);
+  if (flying) return flying;
+  const failedAt = metaFailedAt.get(key);
+  if (failedAt && Date.now() - failedAt < META_RETRY_AFTER_MS) return Promise.resolve(META_FALLBACK);
+
+  const job = (async (): Promise<TokenMeta> => {
+    await metaAcquire();
+    try {
+      const read = async (functionName: 'name' | 'symbol' | 'decimals') =>
+        withRetry(
+          () => publicClient.readContract({ address: token, abi: erc20Abi, functionName } as never),
+          3,
+          350,
+        ).catch(() => null);
+      const [name, symbol, decimals] = await Promise.all([read('name'), read('symbol'), read('decimals')]);
+      if (typeof name === 'string' && name && typeof symbol === 'string' && symbol) {
+        const meta: TokenMeta = {
+          name,
+          symbol,
+          decimals: typeof decimals === 'number' ? decimals : 18,
+          resolved: true,
+        };
+        metaCache.set(key, meta);
+        metaFailedAt.delete(key);
+        lsSet(LS_META, Object.fromEntries(metaCache));
+        return meta;
+      }
+      metaFailedAt.set(key, Date.now());
+      return META_FALLBACK;
+    } finally {
+      metaRelease();
+      metaInflight.delete(key);
+    }
+  })();
+  metaInflight.set(key, job);
+  return job;
 }
 
 // ---------- curve state + quotes (SDK ALCClient) ----------
@@ -247,9 +335,11 @@ export function alcFor(curve: Address): ALCClient {
 
 export async function curveState(curve: Address): Promise<CurveState> {
   const read = async (functionName: string) =>
-    publicClient
-      .readContract({ address: curve, abi: curveAbi as never, functionName: functionName as never })
-      .catch(() => undefined);
+    withRetry(
+      () => publicClient.readContract({ address: curve, abi: curveAbi as never, functionName: functionName as never }),
+      2,
+      350,
+    ).catch(() => undefined);
   const [sqrtPrice, status, feeBps, baseReserve, quoteReserve, threshold, baseToken, quoteToken, canonicalPool] =
     await Promise.all([
       read('sqrtPrice'),
@@ -282,7 +372,7 @@ export interface QuoteResult {
 }
 
 export async function quote(curve: Address, amountIn: bigint, baseForQuote: boolean): Promise<QuoteResult> {
-  const q = await alcFor(curve).quoteExactInput(amountIn, baseForQuote);
+  const q = await withRetry(() => alcFor(curve).quoteExactInput(amountIn, baseForQuote), 3, 500);
   return { amountOut: q.amountOut, fee: q.fee, amountIn: q.amountIn };
 }
 
@@ -297,7 +387,6 @@ export async function sampleCurve(
   baseDecimals: number,
   quoteDecimals: number,
 ): Promise<{ points: CurvePoint[]; side: 'buy' | 'sell' }> {
-  const alc = alcFor(curve);
   const steps = 22;
   const buyAmounts: bigint[] = [];
   for (let i = 0; i < steps; i++) {
@@ -305,16 +394,23 @@ export async function sampleCurve(
     buyAmounts.push(BigInt(Math.floor(10 ** exp)));
   }
   const trySide = async (baseForQuote: boolean, amounts: bigint[]) => {
-    const results = await Promise.all(
-      amounts.map(async (a) => {
-        try {
-          const q = await alc.quoteExactInput(a, baseForQuote);
-          return { inRaw: a, outRaw: q.amountOut };
-        } catch {
-          return null;
-        }
-      }),
-    );
+    // Small sequential batches: 22 concurrent quote calls throttle the RPC
+    // the same way the metadata burst did.
+    const results: ({ inRaw: bigint; outRaw: bigint } | null)[] = [];
+    const BATCH = 5;
+    for (let i = 0; i < amounts.length; i += BATCH) {
+      const part = await Promise.all(
+        amounts.slice(i, i + BATCH).map(async (a) => {
+          try {
+            const q = await quote(curve, a, baseForQuote);
+            return { inRaw: a, outRaw: q.amountOut };
+          } catch {
+            return null;
+          }
+        }),
+      );
+      results.push(...part);
+    }
     return results.filter((r): r is { inRaw: bigint; outRaw: bigint } => r !== null);
   };
   let side: 'buy' | 'sell' = 'buy';
@@ -342,24 +438,26 @@ export async function sampleCurve(
 
 // ---------- launch configs (SDK registry ABI) ----------
 export async function listConfigs(): Promise<LaunchConfig[]> {
-  const next = (await publicClient.readContract({
-    address: REGISTRY,
-    abi: registryAbi as never,
-    functionName: 'nextConfigId' as never,
-  })) as bigint;
+  const regRead = (functionName: string, args?: unknown[]) =>
+    withRetry(
+      () =>
+        publicClient.readContract({
+          address: REGISTRY,
+          abi: registryAbi as never,
+          functionName: functionName as never,
+          ...(args ? { args: args as never } : {}),
+        } as never),
+      3,
+      400,
+    );
+  const next = (await regRead('nextConfigId')) as bigint;
   const total = Math.min(Number(next) - 1, 64);
   const out: LaunchConfig[] = [];
   for (let id = 1; id <= total; id++) {
     const [enabled, segments, hash] = await Promise.all([
-      publicClient
-        .readContract({ address: REGISTRY, abi: registryAbi as never, functionName: 'enabled' as never, args: [BigInt(id)] })
-        .catch(() => false),
-      publicClient
-        .readContract({ address: REGISTRY, abi: registryAbi as never, functionName: 'getCurve' as never, args: [BigInt(id)] })
-        .catch(() => []),
-      publicClient
-        .readContract({ address: REGISTRY, abi: registryAbi as never, functionName: 'configHash' as never, args: [BigInt(id)] })
-        .catch(() => undefined),
+      regRead('enabled', [BigInt(id)]).catch(() => false),
+      regRead('getCurve', [BigInt(id)]).catch(() => []),
+      regRead('configHash', [BigInt(id)]).catch(() => undefined),
     ]);
     const segs = (segments as { lowerSqrtPrice: bigint; upperSqrtPrice: bigint; liquidity: bigint }[]).map((s) => ({
       lower: s.lowerSqrtPrice,
@@ -387,7 +485,7 @@ export async function predictLaunch(
   metadataURI: string,
 ): Promise<{ token: Address; curve: Address }> {
   const alc = new ALCClient(publicClient, DEP.contracts.curveImplementation as Address, REGISTRY);
-  const p = await alc.getPredictedLaunch({ factory: FACTORY, creator, configId, metadataURI });
+  const p = await withRetry(() => alc.getPredictedLaunch({ factory: FACTORY, creator, configId, metadataURI }), 3, 500);
   return { token: p.token as Address, curve: p.curve as Address };
 }
 
